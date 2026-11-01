@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "BM83")(type "KiCad")(uri "${KIPRJMOD}/../lib/BM83.pretty")(options "")(descr "BM83 module footprint"))
+)

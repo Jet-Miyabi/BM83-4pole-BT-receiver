@@ -1,0 +1,41 @@
+Refs,Qty,Value,Footprint,MPN / 候補,DNP,Note
+BT1,1,14500 Li-ion,BatteryHolder_Keystone_2460_1xAA,Keystone 2460 (要: 保護付きセルの長さ適合確認),,4.35V高電圧セル/LiFePO4不可
+C1 C13 C2 C22 C25 C30 C5,7,10u,C_0805_2012Metric,,,Microchip ref C31 / Microchip ref C5/C7 / R2とでfc≈16Hz / U1 BAT_IN直近 / U2 BAT_IN直近
+C12 C14 C31,3,15p,C_0603_1608Metric,,,Microchip ref ボタン入力
+C20 C23,2,4.7u,C_0805_2012Metric,,,
+C21 C24,2,470p,C_0603_1608Metric,,,Microchip ref Aux入力
+C26 C27,2,100u,C_1206_3216Metric,,,DCカット 32Ωでfc≈50Hz
+C10 C11 C3,3,100n,C_0603_1608Metric,,,τ=10ms 音声成分除去
+C15 C4 C6,3,1u,C_0603_1608Metric,,,Microchip ref C22
+C7 C8,2,47n,C_0603_1608Metric,,,DCカット。100nと比較(V4)
+C9,1,220p,C_0603_1608Metric,,,Microchip ref C27
+D1 D2 D5,3,PESD5V0S1BA,D_SOD-323,Nexperia PESD5V0S1BA,,
+D3 D6,2,RED,LED_0603_1608Metric,,,LEDドライバ直結(電流はConfigで設定)
+D4 D7,2,BLUE,LED_0603_1608Metric,,,
+J1,1,TRRS CTIA,Jack_3.5mm_KoreanHropartsElec_PJ-320D-4A_Horizontal,Korean Hroparts PJ-320D-4A (LCSC C95562),,
+J2,1,PROG1,PinHeader_1x06_P2.54mm_Vertical,,,1-2ジャンパ=Test mode。書込時は電池OFFでADAP_INに5V
+J3,1,PROG2,PinHeader_1x06_P2.54mm_Vertical,,,
+J4,1,GPIO1,PinHeader_2x08_P2.54mm_Vertical,,,
+J5,1,I2S1,PinHeader_1x06_P2.54mm_Vertical,,,I2S連携の実験用
+J6,1,GPIO2,PinHeader_2x08_P2.54mm_Vertical,,,AT FWの送信/受信・入力切替GPIOをここでGNDへ
+J7,1,I2S2,PinHeader_1x06_P2.54mm_Vertical,,,
+JP1,1,BIAS_SEL,SolderJumper-3_P1.3mm_Open_Pad1.0x1.5mm,,,既定 1-2短絡(自前バイアス)。2-3でBM83 MICBIAS
+JP2,1,AUXDET_SEL,SolderJumper-3_P1.3mm_Open_Pad1.0x1.5mm,,,1-2: Aux常時検出 / 2-3: U1 GPIO連動(D11案)
+Q1,1,AO3401A,SOT-23,AO3401A,,"逆接続保護: D=電池側, S=負荷側"
+R1 R5,2,100k,R_0603_1608Metric,,,
+R10 R13 R16 R17,4,10k,R_0603_1608Metric,,,ポップ低減ブリーダ
+R11 R14 R18 R2,4,1k,R_0603_1608Metric,,,
+R3,1,2.2k,R_0603_1608Metric,,,Microchip ref R6=2.2k
+R4,1,0,R_0603_1608Metric,,,ジャック直近の1点でGNDへ(ネットタイ)
+R6,1,2.2M,R_0603_1608Metric,,,
+R7,1,390k,R_0603_1608Metric,,,Vth≈0.38V
+R8,1,10M,R_0603_1608Metric,,DNP,ヒステリシス用(DNP)
+SW1,1,POWER,SW_SPDT_PCM12,C&K PCM12SMTR,,
+SW2,1,PLAY(test),SW_Push_1P1T_NO_CK_KMR2,,,PTTと並列の試験用ボタン
+SW3,1,MFB1,SW_Push_1P1T_NO_CK_KMR2,,,MFBはSYS_PWRへ引上げ(アクティブハイ)
+SW4,1,EARPIECE,SW_DIP_SPSTx02_Slide_6.7x6.64mm_W8.61mm_P2.54mm_LowProfile,,,ON=エアチューブイヤホンへ出力
+SW5,1,MFB2,SW_Push_1P1T_NO_CK_KMR2,,,長押しでOpenRun探索
+U1,1,BM83SM1-00AA,BM83SM1,Microchip BM83SM1-00AA / -00AB,,AOHPM未接続(Single-End)
+U2,1,BM83SM1-00TA,BM83SM1,"Microchip BM83SM1-00TA (AT FW書込済の情報あり, 要確認)",,
+U3,1,TLV75525PDBV,SOT-23-5,TI TLV75525PDBVR,,"2.5V LDO, Iq≈25µA. 雑音はR2/C5で減衰"
+U4,1,TLV7041DBV,SOT-23-5,TI TLV7041DBVR,,"ナノパワー, オープンドレイン出力"

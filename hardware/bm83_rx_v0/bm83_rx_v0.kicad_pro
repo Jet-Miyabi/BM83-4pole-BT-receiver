@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "filename": "bm83_rx_v0.kicad_pro",
+    "version": 1
+  },
+  "schematic": {
+    "legacy_lib_dir": "",
+    "legacy_lib_list": []
+  },
+  "sheets": [
+    [
+      "ce8865a8-4aa2-5290-91bb-00a8dfedad57",
+      ""
+    ]
+  ],
+  "text_variables": {}
+}
