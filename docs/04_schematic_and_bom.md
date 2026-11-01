@@ -11,7 +11,7 @@
 | `hardware/bm83_rx_v0/bm83_rx_v0.net` | KiCad のネットリスト（kicad-cli で出力） |
 | `hardware/bm83_rx_v0/bom_v0.csv` | BOM |
 | `hardware/lib/BM83.pretty/BM83SM1.kicad_mod` | BM83 のフットプリント（DS70005402H Fig.8-2 から作成） |
-| `hardware/tools/gen_v0.py` | 上のファイルをすべて生成するスクリプト（設計データの本体） |
+| `hardware/tools/gen_v0.py`、`kigen.py`、`sexpr.py` | 上のファイルをすべて生成するスクリプト（設計データの本体は gen_v0.py） |
 
 再生成するコマンド（KiCad 7 の標準ライブラリがインストールされている環境で実行する）:
 
@@ -23,11 +23,19 @@ python3 hardware/tools/gen_v0.py
 cd hardware/bm83_rx_v0 && kicad-cli sch export pdf -o bm83_rx_v0.pdf bm83_rx_v0.kicad_sch && kicad-cli sch export netlist -o bm83_rx_v0.net bm83_rx_v0.kicad_sch
 ```
 
-回路図の描き方:
-- 配線は線ではなく、すべて**ネットラベル**でつないでいる。
+回路図の描き方（v0.2、2026-11-01 改訂）:
+- 各ブロック内の接続は**線で描いている**。
+- 電源は電源シンボル（`GND`、`VBAT`、`+2V5`）で表している。
+- ネットラベルを使っているのは、次の箇所だけ。
+  - ブロック間をまたぐ信号（例: `MICP1`、`PTT_N`、`HPL1`、`AIL2`、`LINK_EN`）
+  - BM83 のピン
+  - ピンヘッダー
+- **配線の自己検証**: `gen_v0.py` は、各部品に持たせた「意図したネット」と、描いた配線から kicad-cli が出力したネットリストを突き合わせる。1 か所でも食い違うと異常終了する。今回の出力では全ネットが一致した。
 - 未使用のピンには NC フラグを付けている。
-- kicad-cli でネットリストを出力し、全 86 ネットが意図どおりに接続されることを確認した。未接続として出るのは、意図的に NC にしたピンだけ。
 - KiCad 8 以降で開くと形式変換の確認が出るが、そのまま変換して問題ない。
+- 生成スクリプトは 2 つのファイルに分かれている。
+  - `hardware/tools/kigen.py`: 汎用部分（配線の分割、ジャンクションの自動付与、ネットリスト照合）
+  - `hardware/tools/gen_v0.py`: 設計データと配置
 
 ## ブロックごとの設計内容
 

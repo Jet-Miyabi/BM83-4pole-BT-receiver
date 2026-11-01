@@ -1,86 +1,29 @@
 #!/usr/bin/env python3
-"""Generate the KiCad 7 schematic, BOM and BM83 footprint for dev board v0.
+"""Generate the KiCad 7 schematic (with wires), BOM and BM83 footprint for dev board v0.
 
-Single source of truth for the v0 design: edit PARTS below and re-run.
+This script is the single source of truth for the v0 design. Each part carries its
+intended nets; the drawing (wires / power symbols / labels) is then checked against
+those nets by exporting the netlist with kicad-cli. Any mismatch aborts the run.
 
     python3 hardware/tools/gen_v0.py
 
 Outputs (relative to repo root):
-    hardware/bm83_rx_v0/bm83_rx_v0.kicad_sch
-    hardware/bm83_rx_v0/bm83_rx_v0.kicad_pro
-    hardware/bm83_rx_v0/fp-lib-table
-    hardware/bm83_rx_v0/bom_v0.csv
+    hardware/bm83_rx_v0/bm83_rx_v0.kicad_sch / .kicad_pro / .net / fp-lib-table / bom_v0.csv
     hardware/lib/BM83.pretty/BM83SM1.kicad_mod
 """
-import copy
 import csv
 import json
 import os
-import uuid as uuidlib
+import sys
 
-from sexpr import Sym, dump, find, parse
+from kigen import Schematic
+from sexpr import Sym
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 OUT = os.path.join(ROOT, "hardware", "bm83_rx_v0")
 LIBOUT = os.path.join(ROOT, "hardware", "lib", "BM83.pretty")
-KISYM = "/usr/share/kicad/symbols"
 PROJECT = "bm83_rx_v0"
 
-_ns = uuidlib.UUID("6f1d3c2e-8b1a-4e57-9a51-0000b83a0001")
-
-
-def uid(*key):
-    return str(uuidlib.uuid5(_ns, "/".join(str(k) for k in key)))
-
-
-ROOT_UUID = uid("root")
-
-# --------------------------------------------------------------------------
-# Library symbols
-# --------------------------------------------------------------------------
-_libcache = {}
-
-
-def _load_lib(lib):
-    if lib not in _libcache:
-        with open(os.path.join(KISYM, lib + ".kicad_sym"), encoding="utf-8") as f:
-            tree = parse(f.read())
-        _libcache[lib] = {n[1]: n for n in find(tree, "symbol")}
-    return _libcache[lib]
-
-
-def _rename_units(node, old, new):
-    for sub in find(node, "symbol"):
-        if sub[1].startswith(old + "_"):
-            sub[1] = new + sub[1][len(old):]
-
-
-def lib_symbol(lib_id):
-    lib, name = lib_id.split(":")
-    syms = _load_lib(lib)
-    node = copy.deepcopy(syms[name])
-    ext = find(node, "extends")
-    if ext:
-        parent = copy.deepcopy(syms[ext[0][1]])
-        _rename_units(parent, parent[1], name)
-        props = find(node, "property")
-        body = [x for x in parent[2:] if not (isinstance(x, list) and x and x[0] == "property")]
-        node = [Sym("symbol"), name] + props + body
-    node[1] = lib_id
-    pins = {}
-    for sub in find(node, "symbol"):
-        for p in find(sub, "pin"):
-            at = find(p, "at")[0]
-            num = find(p, "number")[0][1]
-            hidden = "hide" in [x for x in p if not isinstance(x, list)]
-            pins[num] = dict(x=float(at[1]), y=float(at[2]), a=int(float(at[3])),
-                             type=str(p[1]), hidden=hidden)
-    return node, pins
-
-
-# --------------------------------------------------------------------------
-# Custom BM83 symbol
-# --------------------------------------------------------------------------
 BM83_LEFT = [
     ("23", "BAT_IN", "power_in"), ("22", "ADAP_IN", "power_in"), ("24", "SYS_PWR", "power_out"),
     ("25", "VDD_IO", "power_out"), ("26", "PWR(MFB)", "input"), ("43", "RST_N", "input"),
@@ -148,16 +91,9 @@ def bm83_symbol():
     return node, pins
 
 
-# --------------------------------------------------------------------------
-# Design data
-# --------------------------------------------------------------------------
-G = 2.54  # grid
-
-
-def g(v):
-    return round(v / G) * G
-
-
+# ==========================================================================
+# Design + drawing
+# ==========================================================================
 FP_R = "Resistor_SMD:R_0603_1608Metric"
 FP_C = "Capacitor_SMD:C_0603_1608Metric"
 FP_C08 = "Capacitor_SMD:C_0805_2012Metric"
@@ -171,83 +107,282 @@ FP_H6 = "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical"
 FP_H16 = "Connector_PinHeader_2.54mm:PinHeader_2x08_P2.54mm_Vertical"
 FP_SJ3 = "Jumper:SolderJumper-3_P1.3mm_Open_Pad1.0x1.5mm"
 
-PARTS = []
+sch = Schematic(PROJECT, "BM83 throat-mic BT receiver - dev board v0")
+sch.add_custom_symbol("BM83_Project:BM83SM1", bm83_symbol()[0])
 
 
-def P(ref, lib_id, value, fp, x, y, nets, dnp=False, mpn="", note=""):
-    PARTS.append(dict(ref=ref, lib_id=lib_id, value=value, fp=fp, x=g(x), y=g(y), nets=nets,
-                      dnp=dnp, mpn=mpn, note=note))
+def _vbat_power_symbol():
+    """power:+BATT cloned as power:VBAT (KiCad 7 takes the net name from the hidden pin name)."""
+    import copy
+    from kigen import lib_symbol
+    from sexpr import find
+    node = copy.deepcopy(lib_symbol("power:+BATT")[0])
+    node[1] = "power:VBAT"
+    for prop in find(node, "property"):
+        if prop[1] == "Value":
+            prop[2] = "VBAT"
+    for sub in find(node, "symbol"):
+        sub[1] = sub[1].replace("+BATT", "VBAT")
+        for pin in find(sub, "pin"):
+            find(pin, "name")[0][1] = "VBAT"
+    return node
 
 
-def R(ref, val, x, y, n1, n2, **kw):
-    P(ref, "Device:R", val, FP_R, x, y, {"1": n1, "2": n2}, **kw)
+sch.add_custom_symbol("power:VBAT", _vbat_power_symbol())
+ROOT_UUID = sch.root
+PARTS = sch.parts
+W = sch.wire
 
 
-def C(ref, val, x, y, n1, n2, fp=FP_C, **kw):
-    P(ref, "Device:C", val, fp, x, y, {"1": n1, "2": n2}, **kw)
+def gnd(pt):
+    sch.power("GND", pt)
 
 
-TEXTS = []
+def vbat(pt):
+    sch.power("VBAT", pt)
 
 
-def T(x, y, text, size=1.8):
-    TEXTS.append((g(x), g(y), text, size))
+def v25(pt):
+    sch.power("+2V5", pt)
 
 
-# ---- Power ----------------------------------------------------------------
-T(25, 25, "POWER: 14500 Li-ion (4.2V max only) -> reverse-polarity P-FET -> slide switch -> VBAT", 2.2)
-P("BT1", "Device:Battery_Cell", "14500 Li-ion", "Battery:BatteryHolder_Keystone_2460_1xAA",
-  35, 55, {"1": "BAT_RAW", "2": "GND"},
-  mpn="Keystone 2460 (要: 保護付きセルの長さ適合確認)", note="4.35V高電圧セル/LiFePO4不可")
-P("Q1", "Device:Q_PMOS_GSD", "AO3401A", FP_SOT23, 60, 50,
-  {"1": "Q1_G", "2": "VBAT_P", "3": "BAT_RAW"}, mpn="AO3401A", note="逆接続保護: D=電池側, S=負荷側")
-R("R1", "100k", 50, 70, "Q1_G", "GND")
-P("SW1", "Switch:SW_SPDT", "POWER", "Button_Switch_SMD:SW_SPDT_PCM12", 90, 50,
-  {"2": "VBAT_P", "1": "VBAT"}, mpn="C&K PCM12SMTR")
-C("C1", "10u", 115, 55, "VBAT", "GND", fp=FP_C08, note="U1 BAT_IN直近")
-C("C2", "10u", 127, 55, "VBAT", "GND", fp=FP_C08, note="U2 BAT_IN直近")
-C("C3", "100n", 139, 55, "VBAT", "GND")
+def V(ref, lib, val, fp, x, y, n1, n2, **kw):
+    """Vertical 2-pin part: pin 1 at top (y-3.81), pin 2 at bottom (y+3.81)."""
+    return sch.part(ref, lib, val, fp, x, y, 0, {"1": n1, "2": n2}, **kw)
 
-# ---- Mic bias LDO -------------------------------------------------------------
-T(25, 95, "MIC BIAS (always-on, independent of MICBIAS so PTT works in idle)", 2.2)
-P("U3", "Regulator_Linear:TLV75525PDBV", "TLV75525PDBV", FP_SOT235, 55, 115,
-  {"1": "VBAT", "3": "VBAT", "2": "GND", "5": "V2V5"}, mpn="TI TLV75525PDBVR",
-  note="2.5V LDO, Iq≈25µA. 雑音はR2/C5で減衰")
-C("C4", "1u", 35, 118, "VBAT", "GND")
-C("C15", "1u", 75, 118, "V2V5", "GND")
-R("R2", "1k", 90, 115, "V2V5", "BIAS_F")
-C("C5", "10u", 102, 118, "BIAS_F", "GND", fp=FP_C08, note="R2とでfc≈16Hz")
-P("JP1", "Jumper:SolderJumper_3_Open", "BIAS_SEL", FP_SJ3, 125, 112,
-  {"1": "BIAS_F", "2": "BIAS_SEL", "3": "MICBIAS1"}, note="既定 1-2短絡(自前バイアス)。2-3でBM83 MICBIAS")
-R("R3", "2.2k", 150, 115, "BIAS_SEL", "MIC", note="Microchip ref R6=2.2k")
-C("C6", "1u", 165, 118, "MICBIAS1", "GND", note="Microchip ref C22")
 
-# ---- Jack & mic input --------------------------------------------------------
-T(25, 140, "4-POLE CTIA JACK: T/R1=air-tube earpiece, R2=mic return, S=MIC", 2.2)
-P("J1", "Connector_Audio:AudioJack4", "TRRS CTIA", "Connector_Audio:Jack_3.5mm_KoreanHropartsElec_PJ-320D-4A_Horizontal",
-  35, 160, {"T": "HP_T", "R1": "HP_R", "R2": "MIC_RET", "S": "MIC"}, mpn="Korean Hroparts PJ-320D-4A (LCSC C95562)")
-R("R4", "0", 60, 165, "MIC_RET", "GND", note="ジャック直近の1点でGNDへ(ネットタイ)")
-C("C9", "220p", 75, 165, "MIC", "MIC_RET", note="Microchip ref C27")
-C("C7", "47n", 90, 165, "MIC", "MICP1", note="DCカット。100nと比較(V4)")
-C("C8", "47n", 105, 165, "MIC_RET", "MICN1", note="DCカット。100nと比較(V4)")
+def H(ref, lib, val, fp, x, y, n1, n2, **kw):
+    """Horizontal 2-pin part: pin 1 left (x-3.81), pin 2 right (x+3.81)."""
+    return sch.part(ref, lib, val, fp, x, y, 90, {"1": n1, "2": n2},
+                    refpos=((x, y - 2.54, None), (x, y + 2.79, None)), **kw)
 
-# ---- PTT detect -----------------------------------------------------------------
-T(130, 148, "PTT DETECT: PTT shorts MIC-GND (1.25 ohm meas.) -> PTT_N low -> U1 P0_2 (PLAY/PAUSE)", 2.2)
-R("R5", "100k", 135, 160, "MIC", "PTT_F")
-C("C10", "100n", 147, 168, "PTT_F", "GND", note="τ=10ms 音声成分除去")
-R("R6", "2.2M", 160, 160, "V2V5", "PTT_TH")
-R("R7", "390k", 160, 182, "PTT_TH", "GND", note="Vth≈0.38V")
-P("U4", "Comparator:TLV7041DBV", "TLV7041DBV", FP_SOT235, 190, 168,
-  {"3": "PTT_F", "4": "PTT_TH", "1": "PTT_N", "5": "V2V5", "2": "GND"}, mpn="TI TLV7041DBVR",
-  note="ナノパワー, オープンドレイン出力")
-C("C11", "100n", 210, 170, "V2V5", "GND")
-R("R8", "10M", 225, 165, "PTT_N", "PTT_F", dnp=True, note="ヒステリシス用(DNP)")
-P("SW2", "Switch:SW_Push", "PLAY(test)", FP_SW, 240, 185, {"1": "PTT_N", "2": "GND"}, note="PTTと並列の試験用ボタン")
-P("D1", "Device:D_TVS", "PESD5V0S1BA", FP_TVS, 240, 200, {"1": "PTT_N", "2": "GND"}, mpn="Nexperia PESD5V0S1BA")
-C("C12", "15p", 255, 200, "PTT_N", "GND", note="Microchip ref ボタン入力")
 
-# ---- U1 BM83 #1 (sink / throat mic) ------------------------------------------------
-T(300, 25, "U1: BM83 #1  standard firmware (Embedded) - HFP/A2DP sink, throat mic", 2.2)
+def Rv(ref, val, x, y, n1, n2, **kw):
+    return V(ref, "Device:R", val, FP_R, x, y, n1, n2, **kw)
+
+
+def Cv(ref, val, x, y, n1, n2, fp=FP_C, **kw):
+    return V(ref, "Device:C", val, fp, x, y, n1, n2, **kw)
+
+
+def Rh(ref, val, x, y, n1, n2, **kw):
+    return H(ref, "Device:R", val, FP_R, x, y, n1, n2, **kw)
+
+
+def Ch(ref, val, x, y, n1, n2, fp=FP_C, **kw):
+    return H(ref, "Device:C", val, fp, x, y, n1, n2, **kw)
+
+
+def shunt_gnd(ref):
+    """Pin 2 of a vertical part to a GND symbol."""
+    gnd(sch.pin(ref, "2"))
+
+
+def header_labels(ref):
+    p = next(q for q in sch.parts if q["ref"] == ref)
+    for num, net in p["nets"].items():
+        if net == "GND":
+            x, y = sch.pin(ref, num)
+            dx, dy = sch.pin_away(ref, num)
+            ln = 10.16 if "01x" in p["lib_id"] else 2.54
+            end = (x + dx * ln, y + dy * ln)
+            W((x, y), end)
+            gnd(end)
+        else:
+            sch.stub_label(net, ref, num)
+
+
+# ---------------------------------------------------------------- POWER
+sch.text(25.4, 33.02, "POWER: 14500 Li-ion (4.2V cells only) -> reverse-polarity P-FET Q1 -> SW1 -> VBAT", 2.0)
+sch.part("BT1", "Device:Battery_Cell", "14500 Li-ion", "Battery:BatteryHolder_Keystone_2460_1xAA",
+         30.48, 55.88, 0, {"1": "BAT_RAW", "2": "GND"},
+         mpn="Keystone 2460 (要: 保護付きセルの長さ適合確認)", note="4.35V高電圧セル/LiFePO4不可",
+         refpos=((34.29, 54.61, "left"), (34.29, 57.15, "left")))
+gnd(sch.pin("BT1", "2"))
+sch.part("Q1", "Device:Q_PMOS_GSD", "AO3401A", FP_SOT23, 50.8, 48.26, 90,
+         {"1": "Q1_G", "2": "VBAT_P", "3": "BAT_RAW"}, mpn="AO3401A", note="逆接続保護: D=電池側, S=負荷側",
+         refpos=((50.8, 40.64, None), (50.8, 38.1, None)))
+W(("BT1", "1"), (30.48, 45.72), ("Q1", "3"))
+Rv("R1", "100k", 50.8, 57.15, "Q1_G", "GND")
+shunt_gnd("R1")
+sch.part("SW1", "Switch:SW_SPDT", "POWER", "Button_Switch_SMD:SW_SPDT_PCM12", 66.04, 45.72, 0,
+         {"2": "VBAT_P", "1": "VBAT"}, mpn="C&K PCM12SMTR",
+         refpos=((66.04, 39.37, None), (66.04, 52.07, None)))
+W(("Q1", "2"), ("SW1", "2"))
+rail = W(("SW1", "1"), (111.76, 43.18))
+vbat((78.74, 43.18))
+Cv("C1", "10u", 86.36, 46.99, "VBAT", "GND", fp=FP_C08, note="U1 BAT_IN直近")
+Cv("C2", "10u", 96.52, 46.99, "VBAT", "GND", fp=FP_C08, note="U2 BAT_IN直近")
+Cv("C3", "100n", 106.68, 46.99, "VBAT", "GND")
+for c in ("C1", "C2", "C3"):
+    shunt_gnd(c)
+
+# ---------------------------------------------------------------- ANALOG FRONT END
+sch.text(25.4, 81.28, "MIC BIAS (always-on 2.5V, so PTT can be detected while idle) / JACK / MIC INPUT / PTT DETECT", 2.0)
+# LDO
+sch.part("U3", "Regulator_Linear:TLV75525PDBV", "TLV75525PDBV", FP_SOT235, 55.88, 96.52, 0,
+         {"1": "VBAT", "3": "VBAT", "2": "GND", "5": "+2V5"}, mpn="TI TLV75525PDBVR",
+         note="2.5V LDO, Iq≈25µA. 雑音はR2/C5で減衰",
+         refpos=((55.88, 87.63, None), (55.88, 90.17, None)))
+W((33.02, 93.98), ("U3", "1"))
+vbat((33.02, 93.98))
+Cv("C4", "1u", 38.1, 97.79, "VBAT", "GND")
+shunt_gnd("C4")
+W(("U3", "3"), (43.18, 96.52), (43.18, 93.98))
+gnd(sch.pin("U3", "2"))
+# 2.5V rail -> RC filter -> JP1
+W(("U3", "5"), (74.93, 93.98))
+W((71.12, 93.98), (71.12, 91.44))
+v25((71.12, 91.44))
+Cv("C15", "1u", 66.04, 97.79, "+2V5", "GND")
+shunt_gnd("C15")
+Rh("R2", "1k", 78.74, 93.98, "+2V5", "BIAS_F")
+W(("R2", "2"), (93.98, 93.98))
+Cv("C5", "10u", 87.63, 97.79, "BIAS_F", "GND", fp=FP_C08, note="R2とでfc≈16Hz")
+shunt_gnd("C5")
+sch.part("JP1", "Jumper:SolderJumper_3_Open", "BIAS_SEL", FP_SJ3, 99.06, 93.98, 0,
+         {"1": "BIAS_F", "2": "BIAS_SEL", "3": "MICBIAS1"},
+         note="既定 1-2短絡(自前バイアス)。2-3でBM83 MICBIAS",
+         refpos=((99.06, 88.9, None), (99.06, 91.44, None)))
+W(("JP1", "3"), (119.38, 93.98))
+Cv("C6", "1u", 111.76, 97.79, "MICBIAS1", "GND", note="Microchip ref C22")
+shunt_gnd("C6")
+sch.label("MICBIAS1", (119.38, 93.98), 0)
+Rv("R3", "2.2k", 99.06, 110.49, "BIAS_SEL", "MIC", note="Microchip ref R6=2.2k")
+W(("JP1", "2"), ("R3", "1"))
+# Jack (pins pointing down: T, R1, R2, S from left to right)
+sch.part("J1", "Connector_Audio:AudioJack4", "TRRS CTIA",
+         "Connector_Audio:Jack_3.5mm_KoreanHropartsElec_PJ-320D-4A_Horizontal", 22.86, 111.76, 270,
+         {"T": "HP_T", "R1": "HP_R", "R2": "MIC_RET", "S": "MIC"},
+         mpn="Korean Hroparts PJ-320D-4A (LCSC C95562)",
+         refpos=((30.48, 107.95, "left"), (30.48, 110.49, "left")))
+MIC_Y, RET_Y = 121.92, 137.16
+W(("J1", "S"), (25.4, MIC_Y), (129.54, MIC_Y))                 # MIC trunk
+W(("R3", "2"), (99.06, MIC_Y))
+W(("J1", "R2"), (22.86, RET_Y), (78.74, RET_Y))                # MIC_RET trunk
+W(("J1", "R1"), (20.32, 147.32))
+sch.label("HP_R", (20.32, 147.32), 270)
+W(("J1", "T"), (17.78, 147.32))
+sch.label("HP_T", (17.78, 147.32), 270)
+Rv("R4", "0", 40.64, 140.97, "MIC_RET", "GND", note="ジャック直近の1点でGNDへ(ネットタイ)")
+shunt_gnd("R4")
+Cv("C9", "220p", 48.26, 125.73, "MIC", "MIC_RET", note="Microchip ref C27")
+W(("C9", "2"), (48.26, RET_Y))
+sch.part("C7", "Device:C", "47n", FP_C, 73.66, 118.11, 180, {"1": "MIC", "2": "MICP1"},
+         note="DCカット。100nと比較(V4)", refpos=((76.2, 113.03, "left"), (76.2, 115.57, "left")))
+sch.stub_label("MICP1", "C7", "2")
+Cv("C8", "47n", 73.66, 140.97, "MIC_RET", "MICN1", note="DCカット。100nと比較(V4)")
+sch.stub_label("MICN1", "C8", "2")
+sch.text(30.48, 160.02, "J1: T/R1 = air-tube earpiece (via SW4), R2 = mic return, S = MIC (CTIA)", 1.5)
+# PTT detect
+Rh("R5", "100k", 133.35, MIC_Y, "MIC", "PTT_F")
+sch.part("U4", "Comparator:TLV7041DBV", "TLV7041DBV", FP_SOT235, 165.1, 124.46, 0,
+         {"3": "PTT_F", "4": "PTT_TH", "1": "PTT_N", "5": "+2V5", "2": "GND"}, mpn="TI TLV7041DBVR",
+         note="ナノパワー, オープンドレイン出力",
+         refpos=((170.18, 132.08, "left"), (170.18, 134.62, "left")))
+W(("R5", "2"), ("U4", "3"))
+Cv("C10", "100n", 139.7, 125.73, "PTT_F", "GND", note="τ=10ms 音声成分除去")
+shunt_gnd("C10")
+W(("U4", "4"), (154.94, 127.0), (154.94, 134.62))
+Rh("R6", "2.2M", 148.59, 134.62, "+2V5", "PTT_TH")
+W(("R6", "2"), (154.94, 134.62))
+v25(sch.pin("R6", "1"))
+Rv("R7", "390k", 154.94, 138.43, "PTT_TH", "GND", note="Vth≈0.38V",
+   refpos=((152.4, 137.16, "right"), (152.4, 139.7, "right")))
+shunt_gnd("R7")
+gnd(sch.pin("U4", "2"))
+W(("U4", "5"), (162.56, 109.22), (177.8, 109.22))
+v25((170.18, 109.22))
+Cv("C11", "100n", 177.8, 113.03, "+2V5", "GND")
+shunt_gnd("C11")
+W(("U4", "1"), (218.44, 124.46))
+sch.label("PTT_N", (218.44, 124.46), 0)
+# hysteresis loop (DNP)
+W((185.42, 124.46), (185.42, 99.06), (172.72, 99.06))
+Rh("R8", "10M", 168.91, 99.06, "PTT_F", "PTT_N", dnp=True, note="ヒステリシス用(DNP)")
+W(("R8", "1"), (152.4, 99.06), (152.4, MIC_Y))
+sch.part("SW2", "Switch:SW_Push", "PLAY(test)", FP_SW, 193.04, 129.54, 270, {"1": "PTT_N", "2": "GND"},
+         note="PTTと並列の試験用ボタン", refpos=((190.5, 144.78, None), (190.5, 147.32, None)))
+gnd(sch.pin("SW2", "2"))
+sch.part("D1", "Device:D_TVS", "PESD5V0S1BA", FP_TVS, 203.2, 128.27, 270, {"1": "PTT_N", "2": "GND"},
+         mpn="Nexperia PESD5V0S1BA", refpos=((205.74, 144.78, None), (205.74, 147.32, None)))
+gnd(sch.pin("D1", "2"))
+Cv("C12", "15p", 213.36, 128.27, "PTT_N", "GND", note="Microchip ref ボタン入力")
+shunt_gnd("C12")
+sch.text(132.08, 152.4, "PTT shorts MIC to GND (1.25 ohm measured) -> PTT_N low -> U1 P0_2 (default PLAY/PAUSE)", 1.5)
+
+
+# ---------------------------------------------------------------- BM83 modules
+def bm83(ref, value, X, Y, nets, mpn, note=""):
+    sch.part(ref, "BM83_Project:BM83SM1", value, "BM83:BM83SM1", X, Y, 0, nets, mpn=mpn, note=note,
+             refpos=((X, Y - 43.18, None), (X, Y - 40.64, None)))
+    gnd_pins = [n for n, net in nets.items() if net == "GND"]
+    pts = []
+    for n in gnd_pins:
+        x, y = sch.pin(ref, n)
+        W((x, y), (x - 2.54, y))
+        pts.append((x - 2.54, y))
+    pts.sort(key=lambda q: q[1])
+    W(pts[0], (pts[0][0], pts[-1][1] + 2.54))
+    gnd((pts[0][0], pts[-1][1] + 2.54))
+    for n, net in nets.items():
+        if net == "GND":
+            continue
+        if net == "VBAT":
+            x, y = sch.pin(ref, n)
+            W((x, y), (x - 5.08, y))
+            vbat((x - 5.08, y))
+            continue
+        x, y = sch.pin(ref, n)
+        dx, _ = sch.pin_away(ref, n)
+        sch.label(net, (x, y), 180 if dx < 0 else 0)
+
+
+def bm83_support(idx, X0, Y0):
+    """MFB switch, LEDs, ADAP_IN cap, programming header for module idx (1 or 2)."""
+    s = str(idx)
+    sw, d_esd, c_esd, led_a, led_b, c_adap, jprog = {
+        1: ("SW3", "D2", "C14", "D3", "D4", "C13", "J2"),
+        2: ("SW5", "D5", "C31", "D6", "D7", "C30", "J3")}[idx]
+    # MFB
+    sch.part(sw, "Switch:SW_Push", f"MFB{s}", FP_SW, X0 + 7.62, Y0, 0, {"1": f"SYSPWR{s}", "2": f"MFB{s}"},
+             note="MFBはSYS_PWRへ引上げ(アクティブハイ)" if idx == 1 else "長押しでOpenRun探索",
+             refpos=((X0 + 7.62, Y0 - 5.08, None), (X0 + 7.62, Y0 - 3.81 + 6.35, None)))
+    sch.stub_label(f"SYSPWR{s}", sw, "1")
+    W((sw, "2"), (X0 + 33.02, Y0))
+    sch.label(f"MFB{s}", (X0 + 33.02, Y0), 0)
+    sch.part(d_esd, "Device:D_TVS", "PESD5V0S1BA", FP_TVS, X0 + 17.78, Y0 + 3.81, 270,
+             {"1": f"MFB{s}", "2": "GND"}, mpn="Nexperia PESD5V0S1BA",
+             refpos=((X0 + 15.24, Y0 + 13.97, None), (X0 + 15.24, Y0 + 16.51, None)))
+    gnd(sch.pin(d_esd, "2"))
+    Cv(c_esd, "15p", X0 + 27.94, Y0 + 3.81, f"MFB{s}", "GND")
+    shunt_gnd(c_esd)
+    # LEDs (anode = SYS_PWR, cathode = LED driver pin)
+    ly = Y0 + 25.4
+    for k, (d, col, net) in enumerate(((led_a, "RED", f"LED{s}A"), (led_b, "BLUE", f"LED{s}B"))):
+        y = ly + k * 10.16
+        sch.part(d, "Device:LED", col, FP_LED, X0 + 12.7, y, 180, {"2": f"SYSPWR{s}", "1": net},
+                 note="LEDドライバ直結(電流はConfigで設定)" if k == 0 else "",
+                 refpos=((X0 + 12.7, y - 3.81, None), (X0 + 12.7, y + 2.54, None)))
+        W((d, "2"), (X0 + 5.08, y))
+        sch.stub_label(net, d, "1")
+    W((X0 + 5.08, ly), (X0 + 5.08, ly + 10.16))
+    W((X0 + 5.08, ly), (X0 + 5.08, ly - 2.54))
+    sch.label(f"SYSPWR{s}", (X0 + 5.08, ly - 2.54), 90)
+    # ADAP_IN cap
+    Cv(c_adap, "10u", X0 + 33.02, ly + 3.81, f"ADAP{s}", "GND", fp=FP_C08,
+       note="Microchip ref C31")
+    sch.stub_label(f"ADAP{s}", c_adap, "1")
+    shunt_gnd(c_adap)
+    # programming header
+    sch.part(jprog, "Connector_Generic:Conn_01x06", f"PROG{s}", FP_H6, X0 + 68.58, ly + 2.54, 0,
+             {"1": f"CFG{s}", "2": "GND", "3": f"TX{s}", "4": f"RX{s}", "5": f"ADAP{s}", "6": f"RST{s}"},
+             note="1-2ジャンパ=Test mode。書込時は電池OFFでADAP_INに5V" if idx == 1 else "",
+             refpos=((X0 + 68.58, ly - 7.62, None), (X0 + 68.58, ly - 5.08, None)))
+    header_labels(jprog)
+
+
+sch.text(289.56, 33.02, "U1: BM83 #1  standard FW (Embedded) - HFP/A2DP sink, throat mic", 2.0)
 U1 = {"23": "VBAT", "22": "ADAP1", "24": "SYSPWR1", "26": "MFB1", "43": "RST1",
       "14": "MICP1", "13": "MICN1", "15": "MICBIAS1", "8": "HPL1", "6": "HPR1",
       "32": "LED1A", "34": "LED1B", "16": "GND", "50": "GND", "56": "GND", "57": "GND",
@@ -256,43 +391,21 @@ U1 = {"23": "VBAT", "22": "ADAP1", "24": "SYSPWR1", "26": "MFB1", "43": "RST1",
       "35": "U1_P0_6", "45": "U1_P0_7", "46": "U1_P1_2", "47": "U1_P1_3", "41": "U1_P1_6",
       "42": "LINK_EN", "21": "U1_P2_6", "39": "U1_P2_7", "20": "U1_P3_2",
       "1": "U1_DR1", "2": "U1_RFS1", "3": "U1_SCLK1", "4": "U1_DT1", "5": "U1_MCLK1"}
-P("U1", "BM83_Project:BM83SM1", "BM83SM1-00AA", "BM83:BM83SM1", 340, 80, U1,
-  mpn="Microchip BM83SM1-00AA / -00AB", note="AOHPM未接続(Single-End)")
-C("C13", "10u", 300, 140, "ADAP1", "GND", fp=FP_C08, note="Microchip ref C31")
-P("SW3", "Switch:SW_Push", "MFB1", FP_SW, 300, 160, {"1": "SYSPWR1", "2": "MFB1"}, note="MFBはSYS_PWRへ引上げ(アクティブハイ)")
-P("D2", "Device:D_TVS", "PESD5V0S1BA", FP_TVS, 300, 175, {"1": "MFB1", "2": "GND"}, mpn="Nexperia PESD5V0S1BA")
-C("C14", "15p", 315, 175, "MFB1", "GND")
-P("D3", "Device:LED", "RED", FP_LED, 340, 160, {"2": "SYSPWR1", "1": "LED1A"}, note="LEDドライバ直結(電流はConfigで設定)")
-P("D4", "Device:LED", "BLUE", FP_LED, 340, 172, {"2": "SYSPWR1", "1": "LED1B"})
-P("J2", "Connector_Generic:Conn_01x06", "PROG1", FP_H6, 380, 165,
-  {"1": "CFG1", "2": "GND", "3": "TX1", "4": "RX1", "5": "ADAP1", "6": "RST1"},
-  note="1-2ジャンパ=Test mode。書込時は電池OFFでADAP_INに5V")
-P("J4", "Connector_Generic:Conn_02x08_Odd_Even", "GPIO1", FP_H16, 300, 205,
-  {"1": "U1_P0_0", "2": "U1_P0_1", "3": "U1_P0_3", "4": "U1_P0_5", "5": "U1_P0_6", "6": "U1_P0_7",
-   "7": "U1_P1_2", "8": "U1_P1_3", "9": "U1_P1_6", "10": "LINK_EN", "11": "U1_P2_6", "12": "U1_P2_7",
-   "13": "U1_P3_2", "14": "U1_P3_7", "15": "GND", "16": "GND"})
-P("J5", "Connector_Generic:Conn_01x06", "I2S1", FP_H6, 365, 205,
-  {"1": "U1_DR1", "2": "U1_RFS1", "3": "U1_SCLK1", "4": "U1_DT1", "5": "U1_MCLK1", "6": "GND"},
-  note="I2S連携の実験用")
+bm83("U1", "BM83SM1-00AA", 330.2, 99.06, U1, "Microchip BM83SM1-00AA / -00AB",
+     note="AOHPM未接続(Single-End)")
+bm83_support(1, 292.1, 160.02)
+sch.part("J4", "Connector_Generic:Conn_02x08_Odd_Even", "GPIO1", FP_H16, 312.42, 223.52, 0,
+         {"1": "U1_P0_0", "2": "U1_P0_1", "3": "U1_P0_3", "4": "U1_P0_5", "5": "U1_P0_6", "6": "U1_P0_7",
+          "7": "U1_P1_2", "8": "U1_P1_3", "9": "U1_P1_6", "10": "LINK_EN", "11": "U1_P2_6", "12": "U1_P2_7",
+          "13": "U1_P3_2", "14": "U1_P3_7", "15": "GND", "16": "GND"},
+         refpos=((312.42, 210.82, None), (312.42, 213.36, None)))
+header_labels("J4")
+sch.part("J5", "Connector_Generic:Conn_01x06", "I2S1", FP_H6, 365.76, 223.52, 0,
+         {"1": "U1_DR1", "2": "U1_RFS1", "3": "U1_SCLK1", "4": "U1_DT1", "5": "U1_MCLK1", "6": "GND"},
+         note="I2S連携の実験用", refpos=((365.76, 210.82, None), (365.76, 213.36, None)))
+header_labels("J5")
 
-# ---- Audio out of U1 -------------------------------------------------------------
-T(25, 230, "U1 AUDIO OUT (Config: Speaker Output = Single End): line to U2 Aux-in + optional air-tube earpiece", 2.2)
-for i, (ch, src, dst) in enumerate([("L", "HPL1", "AIL2"), ("R", "HPR1", "AIR2")]):
-    y0 = 250 + i * 35
-    C(f"C{20 + i * 3}", "4.7u", 35, y0, src, f"LINE{ch}_A", fp=FP_C08)
-    R(f"R{10 + i * 3}", "10k", 50, y0 + 3, f"LINE{ch}_A", "GND")
-    R(f"R{11 + i * 3}", "1k", 65, y0, f"LINE{ch}_A", f"LINE{ch}_B")
-    C(f"C{21 + i * 3}", "470p", 80, y0 + 3, f"LINE{ch}_B", "GND", note="Microchip ref Aux入力")
-    C(f"C{22 + i * 3}", "10u", 95, y0, f"LINE{ch}_B", dst, fp=FP_C08, note="Microchip ref C5/C7")
-C("C26", "100u", 140, 255, "HPL1", "HPL_J", fp=FP_C12, note="DCカット 32Ωでfc≈50Hz")
-C("C27", "100u", 155, 255, "HPR1", "HPR_J", fp=FP_C12)
-P("SW4", "Switch:SW_DIP_x02", "EARPIECE", "Button_Switch_SMD:SW_DIP_SPSTx02_Slide_6.7x6.64mm_W8.61mm_P2.54mm_LowProfile",
-  190, 260, {"1": "HPL_J", "4": "HP_T", "2": "HPR_J", "3": "HP_R"}, note="ON=エアチューブイヤホンへ出力")
-R("R16", "10k", 215, 265, "HP_T", "GND", note="ポップ低減ブリーダ")
-R("R17", "10k", 228, 265, "HP_R", "GND")
-
-# ---- U2 BM83 #2 (AT firmware, A2DP source to OpenRun) ---------------------------------
-T(450, 25, "U2: BM83 #2  AT firmware (Embedded) - A2DP source to Shokz OpenRun", 2.2)
+sch.text(449.58, 33.02, "U2: BM83 #2  AT FW (Embedded) - A2DP source to Shokz OpenRun", 2.0)
 U2 = {"23": "VBAT", "22": "ADAP2", "24": "SYSPWR2", "26": "MFB2", "43": "RST2",
       "12": "AIL2", "11": "AIR2", "32": "LED2A", "34": "LED2B",
       "16": "GND", "50": "GND", "56": "GND", "57": "GND",
@@ -301,113 +414,73 @@ U2 = {"23": "VBAT", "22": "ADAP2", "24": "SYSPWR2", "26": "MFB2", "43": "RST2",
       "40": "U2_P0_5", "35": "U2_P0_6", "45": "U2_P0_7", "46": "U2_P1_2", "47": "U2_P1_3",
       "41": "U2_P1_6", "42": "U2_P2_3", "21": "U2_P2_6", "39": "U2_P2_7",
       "1": "U2_DR1", "2": "U2_RFS1", "3": "U2_SCLK1", "4": "U2_DT1", "5": "U2_MCLK1"}
-P("U2", "BM83_Project:BM83SM1", "BM83SM1-00TA", "BM83:BM83SM1", 500, 80, U2,
-  mpn="Microchip BM83SM1-00TA (AT FW書込済の情報あり, 要確認)")
-C("C30", "10u", 460, 140, "ADAP2", "GND", fp=FP_C08)
-P("SW5", "Switch:SW_Push", "MFB2", FP_SW, 460, 160, {"1": "SYSPWR2", "2": "MFB2"}, note="長押しでOpenRun探索")
-P("D5", "Device:D_TVS", "PESD5V0S1BA", FP_TVS, 460, 175, {"1": "MFB2", "2": "GND"}, mpn="Nexperia PESD5V0S1BA")
-C("C31", "15p", 475, 175, "MFB2", "GND")
-P("D6", "Device:LED", "RED", FP_LED, 500, 160, {"2": "SYSPWR2", "1": "LED2A"})
-P("D7", "Device:LED", "BLUE", FP_LED, 500, 172, {"2": "SYSPWR2", "1": "LED2B"})
-P("J3", "Connector_Generic:Conn_01x06", "PROG2", FP_H6, 540, 165,
-  {"1": "CFG2", "2": "GND", "3": "TX2", "4": "RX2", "5": "ADAP2", "6": "RST2"})
-P("J6", "Connector_Generic:Conn_02x08_Odd_Even", "GPIO2", FP_H16, 460, 205,
-  {"1": "U2_P0_0", "2": "U2_P0_1", "3": "U2_P0_2", "4": "U2_P0_3", "5": "U2_P0_5", "6": "U2_P0_6",
-   "7": "U2_P0_7", "8": "U2_P1_2", "9": "U2_P1_3", "10": "U2_P1_6", "11": "U2_P2_3", "12": "U2_P2_6",
-   "13": "U2_P2_7", "14": "U2_P3_7", "15": "GND", "16": "GND"},
-  note="AT FWの送信/受信・入力切替GPIOをここでGNDへ")
-P("J7", "Connector_Generic:Conn_01x06", "I2S2", FP_H6, 525, 205,
-  {"1": "U2_DR1", "2": "U2_RFS1", "3": "U2_SCLK1", "4": "U2_DT1", "5": "U2_MCLK1", "6": "GND"})
-P("JP2", "Jumper:SolderJumper_3_Open", "AUXDET_SEL", FP_SJ3, 470, 245,
-  {"1": "GND", "2": "AUXDET2", "3": "LINK_EN_R"}, note="1-2: Aux常時検出 / 2-3: U1 GPIO連動(D11案)")
-R("R18", "1k", 495, 245, "LINK_EN_R", "LINK_EN")
+bm83("U2", "BM83SM1-00TA", 492.76, 99.06, U2, "Microchip BM83SM1-00TA (AT FW書込済の情報あり, 要確認)")
+bm83_support(2, 454.66, 160.02)
+sch.part("J6", "Connector_Generic:Conn_02x08_Odd_Even", "GPIO2", FP_H16, 474.98, 223.52, 0,
+         {"1": "U2_P0_0", "2": "U2_P0_1", "3": "U2_P0_2", "4": "U2_P0_3", "5": "U2_P0_5", "6": "U2_P0_6",
+          "7": "U2_P0_7", "8": "U2_P1_2", "9": "U2_P1_3", "10": "U2_P1_6", "11": "U2_P2_3", "12": "U2_P2_6",
+          "13": "U2_P2_7", "14": "U2_P3_7", "15": "GND", "16": "GND"},
+         note="AT FWの送信/受信・入力切替GPIOをここでGNDへ",
+         refpos=((474.98, 210.82, None), (474.98, 213.36, None)))
+header_labels("J6")
+sch.part("J7", "Connector_Generic:Conn_01x06", "I2S2", FP_H6, 528.32, 223.52, 0,
+         {"1": "U2_DR1", "2": "U2_RFS1", "3": "U2_SCLK1", "4": "U2_DT1", "5": "U2_MCLK1", "6": "GND"},
+         refpos=((528.32, 210.82, None), (528.32, 213.36, None)))
+header_labels("J7")
+# Aux-in detect select for U2
+sch.text(449.58, 251.46, "U2 Aux-in detect (P3_2): JP2 1-2 = always detected, 2-3 = follow U1 LINK_EN (D11, unverified)", 1.5)
+sch.part("JP2", "Jumper:SolderJumper_3_Open", "AUXDET_SEL", FP_SJ3, 474.98, 264.16, 0,
+         {"1": "GND", "2": "AUXDET2", "3": "LINK_EN_R"},
+         note="1-2: Aux常時検出 / 2-3: U1 GPIO連動(D11案)",
+         refpos=((474.98, 259.08, None), (474.98, 256.54, None)))
+W(("JP2", "1"), (464.82, 264.16), (464.82, 266.7))
+gnd((464.82, 266.7))
+sch.stub_label("AUXDET2", "JP2", "2")
+Rh("R18", "1k", 488.95, 264.16, "LINK_EN_R", "LINK_EN")
+W(("JP2", "3"), ("R18", "1"))
+W(("R18", "2"), (497.84, 264.16))
+sch.label("LINK_EN", (497.84, 264.16), 0)
 
-# --------------------------------------------------------------------------
-# Emit schematic
-# --------------------------------------------------------------------------
-
-
-def eff(size=1.27, hide=False, justify=None):
-    e = [Sym("effects"), [Sym("font"), [Sym("size"), size, size]]]
-    if justify:
-        e.append([Sym("justify")] + [Sym(j) for j in justify.split()])
-    if hide:
-        e.append(Sym("hide"))
-    return e
-
-
-LABEL_ANGLE = {0: 180, 180: 0, 90: 270, 270: 90}
-LABEL_JUST = {0: "left bottom", 90: "left bottom", 180: "right bottom", 270: "right bottom"}
-
-
-def build():
-    libs, pinmaps = {}, {}
-    for p in PARTS:
-        if p["lib_id"] not in libs:
-            if p["lib_id"].startswith("BM83_Project:"):
-                libs[p["lib_id"]], pinmaps[p["lib_id"]] = bm83_symbol()
-            else:
-                libs[p["lib_id"]], pinmaps[p["lib_id"]] = lib_symbol(p["lib_id"])
-
-    sch = [Sym("kicad_sch"), [Sym("version"), Sym("20230121")], [Sym("generator"), Sym("eeschema")],
-           [Sym("uuid"), ROOT_UUID], [Sym("paper"), "A2"],
-           [Sym("title_block"), [Sym("title"), "BM83 throat-mic BT receiver - dev board v0"],
-            [Sym("date"), "2026-11-01"], [Sym("rev"), "v0.1"],
-            [Sym("comment"), 1, "Generated by hardware/tools/gen_v0.py - edit the script, not this file"],
-            [Sym("comment"), 2, "Values marked 仮/要確認 in BOM must be verified before ordering"]],
-           [Sym("lib_symbols")] + list(libs.values())]
-
-    netpins = {}
-    for p in PARTS:
-        pins = pinmaps[p["lib_id"]]
-        for num in p["nets"]:
-            if num not in pins:
-                raise SystemExit(f"{p['ref']}: unknown pin {num}")
-        two_pin_vertical = len(pins) == 2 and all(pp["a"] in (90, 270) for pp in pins.values())
-        if p["lib_id"] in ("Device:R", "Device:C", "Device:Battery_Cell") or two_pin_vertical:
-            rx, ry, vx, vy, just = p["x"] + 2.54, p["y"] - 1.27, p["x"] + 2.54, p["y"] + 1.27, "left"
-        else:
-            low = 0.0
-            for num, pp in pins.items():
-                yy = p["y"] - pp["y"]
-                if pp["a"] == 90 and p["nets"].get(num):
-                    yy += 1.27 * 0.75 * len(p["nets"][num]) + 1.27
-                low = max(low, yy)
-            low = max(low, p["y"] + 2.54)
-            rx, ry, vx, vy, just = p["x"], low + 2.54, p["x"], low + 5.08, None
-        node = [Sym("symbol"), [Sym("lib_id"), p["lib_id"]], [Sym("at"), p["x"], p["y"], 0],
-                [Sym("unit"), 1], [Sym("in_bom"), Sym("yes")], [Sym("on_board"), Sym("yes")],
-                [Sym("dnp"), Sym("yes" if p["dnp"] else "no")], [Sym("uuid"), uid("sym", p["ref"])],
-                [Sym("property"), "Reference", p["ref"], [Sym("at"), rx, ry, 0],
-                 eff(justify=just)],
-                [Sym("property"), "Value", p["value"], [Sym("at"), vx, vy, 0],
-                 eff(justify=just)],
-                [Sym("property"), "Footprint", p["fp"], [Sym("at"), p["x"], p["y"], 0], eff(hide=True)],
-                [Sym("property"), "Datasheet", "", [Sym("at"), p["x"], p["y"], 0], eff(hide=True)],
-                [Sym("property"), "MPN", p["mpn"], [Sym("at"), p["x"], p["y"], 0], eff(hide=True)],
-                [Sym("property"), "Note", p["note"], [Sym("at"), p["x"], p["y"], 0], eff(hide=True)]]
-        for num in pins:
-            node.append([Sym("pin"), num, [Sym("uuid"), uid("pin", p["ref"], num)]])
-        node.append([Sym("instances"), [Sym("project"), PROJECT,
-                                        [Sym("path"), "/" + ROOT_UUID, [Sym("reference"), p["ref"]],
-                                         [Sym("unit"), 1]]]])
-        sch.append(node)
-        for num, pin in pins.items():
-            px, py = round(p["x"] + pin["x"], 3), round(p["y"] - pin["y"], 3)
-            net = p["nets"].get(num)
-            if net:
-                netpins.setdefault(net, []).append(f"{p['ref']}.{num}")
-                sch.append([Sym("label"), net, [Sym("at"), px, py, LABEL_ANGLE[pin["a"]]],
-                            [Sym("fields_autoplaced")], eff(justify=LABEL_JUST[LABEL_ANGLE[pin["a"]]]),
-                            [Sym("uuid"), uid("lbl", p["ref"], num)]])
-            elif pin["type"] != "no_connect":
-                sch.append([Sym("no_connect"), [Sym("at"), px, py], [Sym("uuid"), uid("nc", p["ref"], num)]])
-    for i, (x, y, text, size) in enumerate(TEXTS):
-        sch.append([Sym("text"), text, [Sym("at"), x, y, 0], eff(size, justify="left bottom"),
-                    [Sym("uuid"), uid("txt", i)]])
-    sch.append([Sym("sheet_instances"), [Sym("path"), "/", [Sym("page"), "1"]]])
-    return sch, netpins
-
+# ---------------------------------------------------------------- AUDIO OUT of U1
+sch.text(25.4, 236.22, "U1 AUDIO OUT (Config: Speaker Output = Single End) -> line to U2 Aux-in  /  -> SW4 -> air-tube earpiece", 2.0)
+for i, (ch, src, dst) in enumerate([("L", "HPL1", "AIL2"), ("R", "HPR1", "AIR2")]):
+    y = 254.0 + i * 25.4
+    n = 20 + i * 3
+    m = 10 + i * 3
+    sch.label(src, (30.48, y), 180)
+    Ch(f"C{n}", "4.7u", 40.64, y, src, f"LINE{ch}_A", fp=FP_C08)
+    W((30.48, y), (f"C{n}", "1"))
+    W((f"C{n}", "2"), (55.88, y))
+    Rv(f"R{m}", "10k", 50.8, y + 3.81, f"LINE{ch}_A", "GND")
+    shunt_gnd(f"R{m}")
+    Rh(f"R{m + 1}", "1k", 59.69, y, f"LINE{ch}_A", f"LINE{ch}_B")
+    W((f"R{m + 1}", "2"), (76.2, y))
+    Cv(f"C{n + 1}", "470p", 68.58, y + 3.81, f"LINE{ch}_B", "GND", note="Microchip ref Aux入力")
+    shunt_gnd(f"C{n + 1}")
+    Ch(f"C{n + 2}", "10u", 80.01, y, f"LINE{ch}_B", dst, fp=FP_C08, note="Microchip ref C5/C7")
+    W((f"C{n + 2}", "2"), (88.9, y))
+    sch.label(dst, (88.9, y), 0)
+sch.label("HPL1", (110.49, 254.0), 180)
+Ch("C26", "100u", 120.65, 254.0, "HPL1", "HPL_J", fp=FP_C12, note="DCカット 32Ωでfc≈50Hz")
+W((110.49, 254.0), ("C26", "1"))
+sch.label("HPR1", (110.49, 264.16), 180)
+Ch("C27", "100u", 120.65, 264.16, "HPR1", "HPR_J", fp=FP_C12)
+W((110.49, 264.16), ("C27", "1"))
+sch.part("SW4", "Switch:SW_DIP_x02", "EARPIECE",
+         "Button_Switch_SMD:SW_DIP_SPSTx02_Slide_6.7x6.64mm_W8.61mm_P2.54mm_LowProfile",
+         139.7, 256.54, 0, {"1": "HPL_J", "4": "HP_T", "2": "HPR_J", "3": "HP_R"},
+         note="ON=エアチューブイヤホンへ出力",
+         refpos=((139.7, 245.11, None), (139.7, 247.65, None)))
+W(("C26", "2"), ("SW4", "1"))
+W(("C27", "2"), (129.54, 264.16), (129.54, 256.54), ("SW4", "2"))
+W(("SW4", "4"), (165.1, 254.0))
+sch.label("HP_T", (165.1, 254.0), 0)
+Rv("R16", "10k", 157.48, 257.81, "HP_T", "GND", note="ポップ低減ブリーダ")
+shunt_gnd("R16")
+W(("SW4", "3"), (149.86, 256.54), (149.86, 269.24), (165.1, 269.24))
+sch.label("HP_R", (165.1, 269.24), 0)
+Rv("R17", "10k", 160.02, 273.05, "HP_R", "GND")
+shunt_gnd("R17")
 
 def write_project():
     pro = {"meta": {"filename": PROJECT + ".kicad_pro", "version": 1},
@@ -491,18 +564,26 @@ def write_footprint():
         f.write("\n".join(lines) + "\n")
 
 
+
 def main():
     os.makedirs(OUT, exist_ok=True)
-    sch, netpins = build()
-    with open(os.path.join(OUT, PROJECT + ".kicad_sch"), "w", encoding="utf-8") as f:
-        f.write(dump(sch) + "\n")
+    sch_path = os.path.join(OUT, PROJECT + ".kicad_sch")
+    with open(sch_path, "w", encoding="utf-8") as f:
+        f.write(sch.build(extra_title=[
+            [Sym("date"), "2026-11-01"], [Sym("rev"), "v0.2"],
+            [Sym("comment"), 1, "Generated by hardware/tools/gen_v0.py - edit the script, not this file"],
+            [Sym("comment"), 2, "Values marked 仮/要確認 in BOM must be verified before ordering"]]))
     write_project()
     rows = write_bom()
     write_footprint()
-    single = {n: v for n, v in netpins.items() if len(v) < 2}
-    print(f"parts={len(PARTS)} nets={len(netpins)} bom_lines={len(rows)}")
-    if single:
-        print("WARNING single-pin nets:", single)
+    errors = sch.verify(sch_path, os.path.join(OUT, PROJECT + ".net"))
+    print(f"parts={len(PARTS)} wires={len(sch.wires)} bom_lines={len(rows)}")
+    if errors:
+        print("NETLIST CHECK FAILED:")
+        for e in errors:
+            print("  ", e)
+        sys.exit(1)
+    print("netlist check: OK (drawing reproduces the intended nets)")
 
 
 if __name__ == "__main__":
